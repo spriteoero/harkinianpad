@@ -1,0 +1,329 @@
+diff --git a/soh/ios/HarkinianPadTouchControls.h b/soh/ios/HarkinianPadTouchControls.h
+index af26545..ceeed80 100644
+--- a/soh/ios/HarkinianPadTouchControls.h
++++ b/soh/ios/HarkinianPadTouchControls.h
+@@ -10,6 +10,10 @@ void HarkinianPad_SetCustomizableTouchControlsEnabled(int enabled);
+ void HarkinianPad_SetTouchControlsOpacity(float opacity);
+ void HarkinianPad_BeginTouchLayoutEditing(void);
+ void HarkinianPad_SetTouchControlsMenuVisible(int visible);
++void HarkinianPad_SetTouchCameraEnabled(int enabled);
++void HarkinianPad_SetTouchCameraGameplayActive(int active);
++// Returns the drag distance in UIKit points since the previous call.
++int HarkinianPad_ConsumeTouchCameraDelta(float* dx, float* dy);
+ 
+ enum {
+     HARKINIANPAD_HUD_BUTTON_A = 0,
+diff --git a/soh/ios/HarkinianPadTouchControls.mm b/soh/ios/HarkinianPadTouchControls.mm
+index 690a7ce..bb6579d 100644
+--- a/soh/ios/HarkinianPadTouchControls.mm
++++ b/soh/ios/HarkinianPadTouchControls.mm
+@@ -16,6 +16,16 @@ static std::atomic_bool sNativeHudTouchDesired(false);
+ static std::atomic_bool sNativeHudTouchGameplayActive(false);
+ static std::atomic<float> sNativeHudButtonCenters[HARKINIANPAD_HUD_BUTTON_COUNT][2];
+ static std::atomic<float> sNativeHudButtonWidths[HARKINIANPAD_HUD_BUTTON_COUNT];
++static std::atomic_bool sTouchCameraDesired(false);
++static std::atomic_bool sTouchCameraGameplayActive(false);
++static std::atomic<float> sTouchCameraDeltaX(0.0f);
++static std::atomic<float> sTouchCameraDeltaY(0.0f);
++
++static void HarkinianPad_AccumulateTouchCamera(std::atomic<float>& total, float delta) {
++    float current = total.load();
++    while (!total.compare_exchange_weak(current, current + delta)) {
++    }
++}
+ 
+ static void HarkinianPad_PushKey(SDL_Scancode scancode, BOOL pressed) {
+     SDL_Event event = {};
+@@ -354,8 +364,85 @@ static HarkinianPadTouchButton* sMenuButton;
+ 
+ @end
+ 
++// Drags that begin on empty space on the right side steer the camera. The
++// controls sit above this view, so their touches are unaffected.
++@interface HarkinianPadCameraDragView : UIView
++
++// Identity of the touch steering the camera; only compared, never dereferenced.
++@property(nonatomic) uintptr_t cameraTouchId;
++@property(nonatomic) CGPoint lastPoint;
++
++- (void)cancelInput;
++
++@end
++
++@implementation HarkinianPadCameraDragView
++
++- (instancetype)initWithFrame:(CGRect)frame {
++    self = [super initWithFrame:frame];
++    if (self != nil) {
++        self.backgroundColor = UIColor.clearColor;
++        self.multipleTouchEnabled = YES;
++    }
++    return self;
++}
++
++- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent*)event {
++    // Outside gameplay, empty space keeps passing through to the game (first-run setup, menus).
++    return sTouchCameraDesired.load() && sTouchCameraGameplayActive.load() && !sLayoutEditorActive.load() &&
++           [super pointInside:point withEvent:event];
++}
++
++- (UITouch*)cameraTouchIn:(NSSet<UITouch*>*)touches {
++    for (UITouch* touch in touches) {
++        if ((uintptr_t)(__bridge void*)touch == self.cameraTouchId) {
++            return touch;
++        }
++    }
++    return nil;
++}
++
++- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
++    if (self.cameraTouchId != 0) {
++        return;
++    }
++    UITouch* touch = touches.anyObject;
++    self.cameraTouchId = (uintptr_t)(__bridge void*)touch;
++    self.lastPoint = [touch locationInView:self];
++}
++
++- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
++    UITouch* touch = [self cameraTouchIn:touches];
++    if (touch == nil || !sTouchCameraDesired.load()) {
++        return;
++    }
++    const CGPoint point = [touch locationInView:self];
++    HarkinianPad_AccumulateTouchCamera(sTouchCameraDeltaX, point.x - self.lastPoint.x);
++    HarkinianPad_AccumulateTouchCamera(sTouchCameraDeltaY, point.y - self.lastPoint.y);
++    self.lastPoint = point;
++}
++
++- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
++    if ([self cameraTouchIn:touches] != nil) {
++        self.cameraTouchId = 0;
++    }
++}
++
++- (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
++    [self touchesEnded:touches withEvent:event];
++}
++
++- (void)cancelInput {
++    self.cameraTouchId = 0;
++    sTouchCameraDeltaX.store(0.0f);
++    sTouchCameraDeltaY.store(0.0f);
++}
++
++@end
++
+ @interface HarkinianPadTouchOverlay : UIView
+ 
++@property(nonatomic, strong) HarkinianPadCameraDragView* cameraDragView;
+ @property(nonatomic, strong) HarkinianPadTouchStick* controlStick;
+ @property(nonatomic, strong) NSArray<HarkinianPadTouchButton*>* buttons;
+ @property(nonatomic, strong) HarkinianPadTouchButton* buttonA;
+@@ -499,6 +586,8 @@ static HarkinianPadTouchButton* sMenuButton;
+         self.editGestures = [NSMutableArray array];
+         self.touchControlsOpacity = 1.0;
+ 
++        self.cameraDragView = [[HarkinianPadCameraDragView alloc] initWithFrame:CGRectZero];
++        [self addSubview:self.cameraDragView];
+         [self addSubview:self.controlStick];
+         for (HarkinianPadTouchButton* button in self.buttons) {
+             [self addSubview:button];
+@@ -520,6 +609,9 @@ static HarkinianPadTouchButton* sMenuButton;
+     CGFloat height = CGRectGetHeight(self.bounds);
+     BOOL compact = height < 560.0;
+ 
++    // Keep the stick side clear so a thumb that misses the stick does not turn the camera.
++    self.cameraDragView.frame = CGRectMake(width * 0.45, 0.0, width * 0.55, height);
++
+     if (compact) {
+         // A phone needs its own grip layout. Scaling the iPad controls down
+         // made the face and C buttons smaller than useful touch targets.
+@@ -1127,6 +1219,7 @@ static HarkinianPadTouchButton* sMenuButton;
+ }
+ 
+ - (void)cancelAllInputs {
++    [self.cameraDragView cancelInput];
+     [self.controlStick cancelInput];
+     for (HarkinianPadTouchButton* button in self.buttons) {
+         [button cancelInput];
+@@ -1324,6 +1417,27 @@ void HarkinianPad_SetTouchControlsMenuVisible(int visible) {
+     });
+ }
+ 
++void HarkinianPad_SetTouchCameraEnabled(int enabled) {
++    sTouchCameraDesired.store(enabled != 0);
++    if (enabled == 0) {
++        sTouchCameraDeltaX.store(0.0f);
++        sTouchCameraDeltaY.store(0.0f);
++    }
++}
++
++void HarkinianPad_SetTouchCameraGameplayActive(int active) {
++    sTouchCameraGameplayActive.store(active != 0);
++}
++
++int HarkinianPad_ConsumeTouchCameraDelta(float* dx, float* dy) {
++    if (dx == nullptr || dy == nullptr) {
++        return 0;
++    }
++    *dx = sTouchCameraDeltaX.exchange(0.0f);
++    *dy = sTouchCameraDeltaY.exchange(0.0f);
++    return *dx != 0.0f || *dy != 0.0f;
++}
++
+ void HarkinianPad_SetNativeHudTouchEnabled(int enabled) {
+     sNativeHudTouchDesired.store(enabled != 0);
+     dispatch_async(dispatch_get_main_queue(), ^{
+diff --git a/soh/soh/Enhancements/bootcommands.c b/soh/soh/Enhancements/bootcommands.c
+index 576a8c3..86206c9 100644
+--- a/soh/soh/Enhancements/bootcommands.c
++++ b/soh/soh/Enhancements/bootcommands.c
+@@ -34,5 +34,13 @@ void BootCommands_Init() {
+     CVarSetInteger(CVAR_SETTING("HarkinianPad.NativeHudTouch"), modernTouchControls);
+     HarkinianPad_SetCustomizableTouchControlsEnabled(modernTouchControls);
+     HarkinianPad_SetNativeHudTouchEnabled(modernTouchControls);
++    CVarRegisterInteger(CVAR_SETTING("HarkinianPad.TouchCamera"), 1);
++    CVarRegisterFloat(CVAR_SETTING("HarkinianPad.TouchCameraSensitivity"), 1.0f);
++    const int touchCamera = CVarGetInteger(CVAR_SETTING("HarkinianPad.TouchCamera"), 1);
++    if (touchCamera) {
++        // The third-person touch camera drives the Free Look camera.
++        CVarSetInteger(CVAR_SETTING("FreeLook.Enabled"), 1);
++    }
++    HarkinianPad_SetTouchCameraEnabled(touchCamera);
+ #endif
+ }
+diff --git a/soh/soh/Enhancements/controls/Mouse.cpp b/soh/soh/Enhancements/controls/Mouse.cpp
+index 043b7f8..b41eb4e 100644
+--- a/soh/soh/Enhancements/controls/Mouse.cpp
++++ b/soh/soh/Enhancements/controls/Mouse.cpp
+@@ -7,9 +7,23 @@
+ #include "soh/Enhancements/game-interactor/GameInteractor_Hooks.h"
+ #include "soh/ShipInit.hpp"
+ 
++#ifdef __IOS__
++#include "ios/HarkinianPadTouchControls.h"
++#endif
++
+ static Ship::Coords mouseCoord = {};
+ static Ship::Coords mouseCoordRel = {};
+ 
++#ifdef __IOS__
++// Drag distance for this frame in UIKit points; zero while touch camera is off.
++static f32 touchCameraRelX = 0.0f;
++static f32 touchCameraRelY = 0.0f;
++
++static f32 TouchCamera_Sensitivity() {
++    return CVarGetFloat(CVAR_SETTING("HarkinianPad.TouchCameraSensitivity"), 1.0f);
++}
++#endif
++
+ #define CVAR_ENABLE_MOUSE_NAME CVAR_SETTING("EnableMouse")
+ #define CVAR_ENABLE_MOUSE_DEFAULT 0
+ #define CVAR_ENABLE_MOUSE_VALUE CVarGetInteger(CVAR_ENABLE_MOUSE_NAME, CVAR_ENABLE_MOUSE_DEFAULT)
+@@ -31,6 +45,13 @@ void Mouse_UpdatePosRel() {
+ void Mouse_UpdateAll() {
+     Mouse_UpdatePos();
+     Mouse_UpdatePosRel();
++#ifdef __IOS__
++    if (!HarkinianPad_ConsumeTouchCameraDelta(&touchCameraRelX, &touchCameraRelY) ||
++        !CVarGetInteger(CVAR_SETTING("HarkinianPad.TouchCamera"), 1)) {
++        touchCameraRelX = 0.0f;
++        touchCameraRelY = 0.0f;
++    }
++#endif
+ }
+ 
+ void Mouse_HandleThirdPerson(f32* newCamX, f32* newCamY) {
+@@ -38,6 +59,11 @@ void Mouse_HandleThirdPerson(f32* newCamX, f32* newCamY) {
+         *newCamX -= mouseCoordRel.x * 40.0f;
+         *newCamY -= mouseCoordRel.y * 40.0f;
+     }
++#ifdef __IOS__
++    // A point is a few pixels wide, so touch needs a larger scale than the mouse.
++    *newCamX -= touchCameraRelX * 64.0f * TouchCamera_Sensitivity();
++    *newCamY -= touchCameraRelY * 64.0f * TouchCamera_Sensitivity();
++#endif
+ }
+ 
+ void Mouse_HandleFirstPerson(Player* player) {
+@@ -54,6 +80,11 @@ void Mouse_HandleFirstPerson(Player* player) {
+         player->actor.focus.rot.y -= static_cast<int16_t>(mouseCoordRel.x * 6.0f * xAxisMulti * invertXAxisMulti);
+         player->actor.focus.rot.x += static_cast<int16_t>(mouseCoordRel.y * 6.0f * yAxisMulti * invertYAxisMulti);
+     }
++#ifdef __IOS__
++    const f32 touchScale = 20.0f * TouchCamera_Sensitivity();
++    player->actor.focus.rot.y -= static_cast<int16_t>(touchCameraRelX * touchScale * xAxisMulti * invertXAxisMulti);
++    player->actor.focus.rot.x += static_cast<int16_t>(touchCameraRelY * touchScale * yAxisMulti * invertYAxisMulti);
++#endif
+ }
+ 
+ void Mouse_RecenterCursor() {
+diff --git a/soh/soh/SohGui/SohMenuSettings.cpp b/soh/soh/SohGui/SohMenuSettings.cpp
+index 9345eef..8950eb1 100644
+--- a/soh/soh/SohGui/SohMenuSettings.cpp
++++ b/soh/soh/SohGui/SohMenuSettings.cpp
+@@ -522,6 +522,37 @@ void SohMenu::AddMenuSettings() {
+         .Options(ButtonOptions().Tooltip(
+             "Closes Settings and opens the layout editor. Drag controls, resize the selected control, hide "
+             "unused buttons, or restore the phone or tablet defaults."));
++    AddWidget(path, "Touch Camera", WIDGET_CVAR_CHECKBOX)
++        .CVar(CVAR_SETTING("HarkinianPad.TouchCamera"))
++        .RaceDisable(false)
++        .PreFunc([](WidgetInfo& info) {
++            info.isHidden = !HarkinianPad_TouchControlsAvailable();
++        })
++        .Callback([](WidgetInfo& info) {
++            const bool enabled = CVarGetInteger(CVAR_SETTING("HarkinianPad.TouchCamera"), 1);
++            if (enabled) {
++                CVarSetInteger(CVAR_SETTING("FreeLook.Enabled"), 1);
++            }
++            HarkinianPad_SetTouchCameraEnabled(enabled);
++        })
++        .Options(CheckboxOptions()
++                     .DefaultValue(true)
++                     .Tooltip("Drag on empty space on the right side of the screen to turn the camera, or to "
++                              "aim in first-person view. Turns on Free Look. Targeting recenters the camera."));
++    AddWidget(path, "Touch Camera Sensitivity", WIDGET_CVAR_SLIDER_FLOAT)
++        .CVar(CVAR_SETTING("HarkinianPad.TouchCameraSensitivity"))
++        .RaceDisable(false)
++        .PreFunc([](WidgetInfo& info) {
++            info.isHidden = !HarkinianPad_TouchControlsAvailable() ||
++                            !CVarGetInteger(CVAR_SETTING("HarkinianPad.TouchCamera"), 1);
++        })
++        .Options(FloatSliderOptions()
++                     .IsPercentage()
++                     .Min(0.25f)
++                     .Max(4.0f)
++                     .DefaultValue(1.0f)
++                     .Tooltip("How far the camera turns for each drag. Free Look's axis inversion settings also "
++                              "apply."));
+ #endif
+     AddWidget(path, "Clear Devices", WIDGET_BUTTON)
+         .Callback([](WidgetInfo& info) {
+diff --git a/soh/src/code/z_parameter.c b/soh/src/code/z_parameter.c
+index bd7e6e4..22950a4 100644
+--- a/soh/src/code/z_parameter.c
++++ b/soh/src/code/z_parameter.c
+@@ -5296,6 +5296,9 @@ void Interface_Draw(PlayState* play) {
+ #ifdef __IOS__
+     HarkinianPad_SetNativeHudTouchGameplayActive(gSaveContext.gameMode == GAMEMODE_NORMAL && fullUi &&
+                                                   pauseCtx->state == 0 && pauseCtx->debugState == 0);
++    // Unlike the HUD artwork, the camera stays usable when Minimal UI hides the HUD.
++    HarkinianPad_SetTouchCameraGameplayActive(gSaveContext.gameMode == GAMEMODE_NORMAL && pauseCtx->state == 0 &&
++                                              pauseCtx->debugState == 0);
+ #endif
+     // #region SOH [NTSC]
+     s32 languageOffset = gSaveContext.language;
+diff --git a/soh/src/code/z_play.c b/soh/src/code/z_play.c
+index f69e8bc..5424485 100644
+--- a/soh/src/code/z_play.c
++++ b/soh/src/code/z_play.c
+@@ -204,6 +204,7 @@ void Play_Destroy(GameState* thisx) {
+ 
+ #ifdef __IOS__
+     HarkinianPad_SetNativeHudTouchGameplayActive(0);
++    HarkinianPad_SetTouchCameraGameplayActive(0);
+ #endif
+ 
+     GameInteractor_ExecuteOnPlayDestroy();
