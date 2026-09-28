@@ -17,13 +17,15 @@ index af26545..6b11f12 100644
  enum {
      HARKINIANPAD_HUD_BUTTON_A = 0,
 diff --git a/soh/ios/HarkinianPadTouchControls.mm b/soh/ios/HarkinianPadTouchControls.mm
-index 690a7ce..7a84ef4 100644
+index 690a7ce..0d74126 100644
 --- a/soh/ios/HarkinianPadTouchControls.mm
 +++ b/soh/ios/HarkinianPadTouchControls.mm
-@@ -16,8 +16,24 @@ static std::atomic_bool sNativeHudTouchDesired(false);
+@@ -16,8 +16,26 @@ static std::atomic_bool sNativeHudTouchDesired(false);
  static std::atomic_bool sNativeHudTouchGameplayActive(false);
  static std::atomic<float> sNativeHudButtonCenters[HARKINIANPAD_HUD_BUTTON_COUNT][2];
  static std::atomic<float> sNativeHudButtonWidths[HARKINIANPAD_HUD_BUTTON_COUNT];
++// Width / height of the overlay, which spans the whole window.
++static std::atomic<float> sOverlayAspectRatio(0.0f);
 +static std::atomic_bool sTouchCameraDesired(false);
 +static std::atomic_bool sTouchCameraGameplayActive(false);
 +static std::atomic_bool sFreeCamToggleRequested(false);
@@ -45,7 +47,7 @@ index 690a7ce..7a84ef4 100644
      SDL_Event event = {};
      event.type = pressed ? SDL_KEYDOWN : SDL_KEYUP;
      event.key.timestamp = SDL_GetTicks();
-@@ -354,8 +370,85 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -354,8 +372,85 @@ static HarkinianPadTouchButton* sMenuButton;
  
  @end
  
@@ -131,7 +133,7 @@ index 690a7ce..7a84ef4 100644
  @property(nonatomic, strong) HarkinianPadTouchStick* controlStick;
  @property(nonatomic, strong) NSArray<HarkinianPadTouchButton*>* buttons;
  @property(nonatomic, strong) HarkinianPadTouchButton* buttonA;
-@@ -372,6 +465,7 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -372,6 +467,7 @@ static HarkinianPadTouchButton* sMenuButton;
  @property(nonatomic, strong) HarkinianPadTouchButton* cDown;
  @property(nonatomic, strong) HarkinianPadTouchButton* cLeft;
  @property(nonatomic, strong) HarkinianPadTouchButton* cRight;
@@ -139,7 +141,7 @@ index 690a7ce..7a84ef4 100644
  @property(nonatomic) BOOL customizableControls;
  @property(nonatomic) BOOL layoutEditing;
  @property(nonatomic) CGFloat touchControlsOpacity;
-@@ -399,6 +493,7 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -399,6 +495,7 @@ static HarkinianPadTouchButton* sMenuButton;
  - (void)finishControlLayoutForCompact:(BOOL)compact;
  - (void)publishNativeHudButtonCenters;
  - (void)applyNativeHudVisualState;
@@ -147,7 +149,7 @@ index 690a7ce..7a84ef4 100644
  
  @end
  
-@@ -434,6 +529,11 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -434,6 +531,11 @@ static HarkinianPadTouchButton* sMenuButton;
              [[HarkinianPadTouchButton alloc] initWithLabel:@"◀" scancode:SDL_SCANCODE_LEFT pill:NO];
          self.cRight =
              [[HarkinianPadTouchButton alloc] initWithLabel:@"▶" scancode:SDL_SCANCODE_RIGHT pill:NO];
@@ -159,7 +161,7 @@ index 690a7ce..7a84ef4 100644
  
          [self.buttonA
              applyIdleColor:[UIColor colorWithRed:0.08 green:0.35 blue:0.88 alpha:0.58]
-@@ -463,6 +563,7 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -463,6 +565,7 @@ static HarkinianPadTouchButton* sMenuButton;
          self.cDown.accessibilityLabel = @"C Down";
          self.cLeft.accessibilityLabel = @"C Left";
          self.cRight.accessibilityLabel = @"C Right";
@@ -167,7 +169,7 @@ index 690a7ce..7a84ef4 100644
  
          self.controlStick.accessibilityIdentifier = @"stick";
          self.buttonA.accessibilityIdentifier = @"a";
-@@ -479,18 +580,19 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -479,18 +582,19 @@ static HarkinianPadTouchButton* sMenuButton;
          self.cDown.accessibilityIdentifier = @"c-down";
          self.cLeft.accessibilityIdentifier = @"c-left";
          self.cRight.accessibilityIdentifier = @"c-right";
@@ -189,7 +191,7 @@ index 690a7ce..7a84ef4 100644
          ];
          self.layoutCenters = [NSMutableDictionary dictionary];
          self.layoutScales = [NSMutableDictionary dictionary];
-@@ -499,15 +601,34 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -499,15 +603,34 @@ static HarkinianPadTouchButton* sMenuButton;
          self.editGestures = [NSMutableArray array];
          self.touchControlsOpacity = 1.0;
  
@@ -224,7 +226,7 @@ index 690a7ce..7a84ef4 100644
  - (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
      UIView* hit = [super hitTest:point withEvent:event];
      return hit == self ? nil : hit;
-@@ -520,6 +641,9 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -520,6 +643,9 @@ static HarkinianPadTouchButton* sMenuButton;
      CGFloat height = CGRectGetHeight(self.bounds);
      BOOL compact = height < 560.0;
  
@@ -234,7 +236,7 @@ index 690a7ce..7a84ef4 100644
      if (compact) {
          // A phone needs its own grip layout. Scaling the iPad controls down
          // made the face and C buttons smaller than useful touch targets.
-@@ -537,6 +661,9 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -537,6 +663,9 @@ static HarkinianPadTouchButton* sMenuButton;
          self.buttonL.frame =
              CGRectMake(CGRectGetMinX(self.buttonR.frame), CGRectGetMaxY(self.buttonR.frame) + 8.0,
                         shoulderWidth, shoulderHeight);
@@ -244,7 +246,7 @@ index 690a7ce..7a84ef4 100644
  
          CGFloat dSize = 44.0;
          CGFloat dRadius = 38.0;
-@@ -696,6 +823,9 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -696,6 +825,9 @@ static HarkinianPadTouchButton* sMenuButton;
      self.buttonL.frame =
          CGRectMake(CGRectGetMinX(self.buttonR.frame), CGRectGetMaxY(self.buttonR.frame) + shoulderGap,
                     shoulderWidth, pillHeight);
@@ -254,7 +256,15 @@ index 690a7ce..7a84ef4 100644
  
      CGFloat labelSize = 18.0 * scale;
      for (HarkinianPadTouchButton* button in self.buttons) {
-@@ -1127,6 +1257,7 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -1096,6 +1228,7 @@ static HarkinianPadTouchButton* sMenuButton;
+         return;
+     }
+ 
++    sOverlayAspectRatio.store(width / height);
+     NSArray<HarkinianPadTouchButton*>* nativeButtons = @[
+         self.buttonA, self.buttonB, self.cUp, self.cDown, self.cLeft, self.cRight,
+     ];
+@@ -1127,6 +1260,7 @@ static HarkinianPadTouchButton* sMenuButton;
  }
  
  - (void)cancelAllInputs {
@@ -262,7 +272,7 @@ index 690a7ce..7a84ef4 100644
      [self.controlStick cancelInput];
      for (HarkinianPadTouchButton* button in self.buttons) {
          [button cancelInput];
-@@ -1324,6 +1455,41 @@ void HarkinianPad_SetTouchControlsMenuVisible(int visible) {
+@@ -1324,6 +1458,41 @@ void HarkinianPad_SetTouchControlsMenuVisible(int visible) {
      });
  }
  
@@ -304,6 +314,63 @@ index 690a7ce..7a84ef4 100644
  void HarkinianPad_SetNativeHudTouchEnabled(int enabled) {
      sNativeHudTouchDesired.store(enabled != 0);
      dispatch_async(dispatch_get_main_queue(), ^{
+@@ -1353,6 +1522,23 @@ void HarkinianPad_SetNativeHudTouchGameplayActive(int active) {
+     });
+ }
+ 
++// SoH can draw the game at a fixed aspect ratio (Advanced Resolution, N64 mode), centred in the
++// window with black bars, while the touch controls span the whole window. Returns the part of the
++// window the game image covers, as fractions of the window's width and height.
++static void HarkinianPad_GameImageFraction(float aspectRatio, float* widthFraction, float* heightFraction) {
++    const float overlayAspectRatio = sOverlayAspectRatio.load();
++    *widthFraction = 1.0f;
++    *heightFraction = 1.0f;
++    if (overlayAspectRatio <= 0.0f) {
++        return;
++    }
++    if (aspectRatio < overlayAspectRatio) {
++        *widthFraction = aspectRatio / overlayAspectRatio;
++    } else {
++        *heightFraction = overlayAspectRatio / aspectRatio;
++    }
++}
++
+ int HarkinianPad_GetNativeHudButtonCenter(int button, float aspectRatio, float* x, float* y) {
+     if (button < 0 || button >= HARKINIANPAD_HUD_BUTTON_COUNT || x == nullptr || y == nullptr ||
+         aspectRatio <= 0.0f || !sTouchControlsDesired.load() || !sNativeHudTouchDesired.load() ||
+@@ -1367,10 +1553,17 @@ int HarkinianPad_GetNativeHudButtonCenter(int button, float aspectRatio, float*
+         return 0;
+     }
+ 
++    // Re-measure the window-relative centre against the centred game image.
++    float widthFraction;
++    float heightFraction;
++    HarkinianPad_GameImageFraction(aspectRatio, &widthFraction, &heightFraction);
++    const float imageX = (normalizedX - (1.0f - widthFraction) * 0.5f) / widthFraction;
++    const float imageY = (normalizedY - (1.0f - heightFraction) * 0.5f) / heightFraction;
++
+     const float virtualWidth = 240.0f * aspectRatio;
+     const float virtualLeft = 160.0f - virtualWidth * 0.5f;
+-    *x = virtualLeft + normalizedX * virtualWidth;
+-    *y = normalizedY * 240.0f;
++    *x = virtualLeft + imageX * virtualWidth;
++    *y = imageY * 240.0f;
+     return 1;
+ }
+ 
+@@ -1392,7 +1585,11 @@ float HarkinianPad_GetNativeHudButtonScale(int button, float aspectRatio) {
+         return 1.0f;
+     }
+ 
+-    const float virtualWidth = normalizedWidth * 240.0f;
++    // The width is measured against the window height; the game's 240 units span the image height.
++    float widthFraction;
++    float heightFraction;
++    HarkinianPad_GameImageFraction(aspectRatio, &widthFraction, &heightFraction);
++    const float virtualWidth = normalizedWidth / heightFraction * 240.0f;
+     return virtualWidth / nativeButtonWidths[button];
+ }
+ 
 diff --git a/soh/soh/Enhancements/bootcommands.c b/soh/soh/Enhancements/bootcommands.c
 index 576a8c3..a4bb9fd 100644
 --- a/soh/soh/Enhancements/bootcommands.c
