@@ -1,8 +1,8 @@
 diff --git a/soh/ios/HarkinianPadTouchControls.h b/soh/ios/HarkinianPadTouchControls.h
-index af26545..ceeed80 100644
+index af26545..6b11f12 100644
 --- a/soh/ios/HarkinianPadTouchControls.h
 +++ b/soh/ios/HarkinianPadTouchControls.h
-@@ -10,6 +10,10 @@ void HarkinianPad_SetCustomizableTouchControlsEnabled(int enabled);
+@@ -10,6 +10,13 @@ void HarkinianPad_SetCustomizableTouchControlsEnabled(int enabled);
  void HarkinianPad_SetTouchControlsOpacity(float opacity);
  void HarkinianPad_BeginTouchLayoutEditing(void);
  void HarkinianPad_SetTouchControlsMenuVisible(int visible);
@@ -10,19 +10,24 @@ index af26545..ceeed80 100644
 +void HarkinianPad_SetTouchCameraGameplayActive(int active);
 +// Returns the drag distance in UIKit points since the previous call.
 +int HarkinianPad_ConsumeTouchCameraDelta(float* dx, float* dy);
++// Returns 1 once per tap of the free camera button.
++int HarkinianPad_ConsumeFreeCamToggle(void);
++void HarkinianPad_SetFreeCamActive(int active);
  
  enum {
      HARKINIANPAD_HUD_BUTTON_A = 0,
 diff --git a/soh/ios/HarkinianPadTouchControls.mm b/soh/ios/HarkinianPadTouchControls.mm
-index 690a7ce..bb6579d 100644
+index 690a7ce..7a84ef4 100644
 --- a/soh/ios/HarkinianPadTouchControls.mm
 +++ b/soh/ios/HarkinianPadTouchControls.mm
-@@ -16,6 +16,16 @@ static std::atomic_bool sNativeHudTouchDesired(false);
+@@ -16,8 +16,24 @@ static std::atomic_bool sNativeHudTouchDesired(false);
  static std::atomic_bool sNativeHudTouchGameplayActive(false);
  static std::atomic<float> sNativeHudButtonCenters[HARKINIANPAD_HUD_BUTTON_COUNT][2];
  static std::atomic<float> sNativeHudButtonWidths[HARKINIANPAD_HUD_BUTTON_COUNT];
 +static std::atomic_bool sTouchCameraDesired(false);
 +static std::atomic_bool sTouchCameraGameplayActive(false);
++static std::atomic_bool sFreeCamToggleRequested(false);
++static std::atomic_bool sFreeCamActive(false);
 +static std::atomic<float> sTouchCameraDeltaX(0.0f);
 +static std::atomic<float> sTouchCameraDeltaY(0.0f);
 +
@@ -33,8 +38,14 @@ index 690a7ce..bb6579d 100644
 +}
  
  static void HarkinianPad_PushKey(SDL_Scancode scancode, BOOL pressed) {
++    // Buttons that act on their own (the free camera toggle) have no key to send.
++    if (scancode == SDL_SCANCODE_UNKNOWN) {
++        return;
++    }
      SDL_Event event = {};
-@@ -354,8 +364,85 @@ static HarkinianPadTouchButton* sMenuButton;
+     event.type = pressed ? SDL_KEYDOWN : SDL_KEYUP;
+     event.key.timestamp = SDL_GetTicks();
+@@ -354,8 +370,85 @@ static HarkinianPadTouchButton* sMenuButton;
  
  @end
  
@@ -63,8 +74,8 @@ index 690a7ce..bb6579d 100644
 +
 +- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent*)event {
 +    // Outside gameplay, empty space keeps passing through to the game (first-run setup, menus).
-+    return sTouchCameraDesired.load() && sTouchCameraGameplayActive.load() && !sLayoutEditorActive.load() &&
-+           [super pointInside:point withEvent:event];
++    return (sTouchCameraDesired.load() || sFreeCamActive.load()) && sTouchCameraGameplayActive.load() &&
++           !sLayoutEditorActive.load() && [super pointInside:point withEvent:event];
 +}
 +
 +- (UITouch*)cameraTouchIn:(NSSet<UITouch*>*)touches {
@@ -87,7 +98,7 @@ index 690a7ce..bb6579d 100644
 +
 +- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
 +    UITouch* touch = [self cameraTouchIn:touches];
-+    if (touch == nil || !sTouchCameraDesired.load()) {
++    if (touch == nil || !(sTouchCameraDesired.load() || sFreeCamActive.load())) {
 +        return;
 +    }
 +    const CGPoint point = [touch locationInView:self];
@@ -120,7 +131,65 @@ index 690a7ce..bb6579d 100644
  @property(nonatomic, strong) HarkinianPadTouchStick* controlStick;
  @property(nonatomic, strong) NSArray<HarkinianPadTouchButton*>* buttons;
  @property(nonatomic, strong) HarkinianPadTouchButton* buttonA;
-@@ -499,6 +586,8 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -372,6 +465,7 @@ static HarkinianPadTouchButton* sMenuButton;
+ @property(nonatomic, strong) HarkinianPadTouchButton* cDown;
+ @property(nonatomic, strong) HarkinianPadTouchButton* cLeft;
+ @property(nonatomic, strong) HarkinianPadTouchButton* cRight;
++@property(nonatomic, strong) HarkinianPadTouchButton* buttonFreeCam;
+ @property(nonatomic) BOOL customizableControls;
+ @property(nonatomic) BOOL layoutEditing;
+ @property(nonatomic) CGFloat touchControlsOpacity;
+@@ -399,6 +493,7 @@ static HarkinianPadTouchButton* sMenuButton;
+ - (void)finishControlLayoutForCompact:(BOOL)compact;
+ - (void)publishNativeHudButtonCenters;
+ - (void)applyNativeHudVisualState;
++- (void)applyFreeCamState;
+ 
+ @end
+ 
+@@ -434,6 +529,11 @@ static HarkinianPadTouchButton* sMenuButton;
+             [[HarkinianPadTouchButton alloc] initWithLabel:@"◀" scancode:SDL_SCANCODE_LEFT pill:NO];
+         self.cRight =
+             [[HarkinianPadTouchButton alloc] initWithLabel:@"▶" scancode:SDL_SCANCODE_RIGHT pill:NO];
++        self.buttonFreeCam =
++            [[HarkinianPadTouchButton alloc] initWithLabel:@"📷" scancode:SDL_SCANCODE_UNKNOWN pill:NO];
++        [self.buttonFreeCam addTarget:self
++                               action:@selector(freeCamTapped)
++                     forControlEvents:UIControlEventTouchUpInside];
+ 
+         [self.buttonA
+             applyIdleColor:[UIColor colorWithRed:0.08 green:0.35 blue:0.88 alpha:0.58]
+@@ -463,6 +563,7 @@ static HarkinianPadTouchButton* sMenuButton;
+         self.cDown.accessibilityLabel = @"C Down";
+         self.cLeft.accessibilityLabel = @"C Left";
+         self.cRight.accessibilityLabel = @"C Right";
++        self.buttonFreeCam.accessibilityLabel = @"Free Camera";
+ 
+         self.controlStick.accessibilityIdentifier = @"stick";
+         self.buttonA.accessibilityIdentifier = @"a";
+@@ -479,18 +580,19 @@ static HarkinianPadTouchButton* sMenuButton;
+         self.cDown.accessibilityIdentifier = @"c-down";
+         self.cLeft.accessibilityIdentifier = @"c-left";
+         self.cRight.accessibilityIdentifier = @"c-right";
++        self.buttonFreeCam.accessibilityIdentifier = @"freecam";
+ 
+         self.buttons = @[
+             self.buttonA, self.buttonB, self.buttonL, self.buttonZRight,
+             self.buttonR, self.buttonStart,
+             self.dUp, self.dDown, self.dLeft, self.dRight, self.cUp, self.cDown,
+-            self.cLeft, self.cRight,
++            self.cLeft, self.cRight, self.buttonFreeCam,
+         ];
+         self.editableControls = @[
+             self.controlStick, self.buttonA, self.buttonB, self.buttonL,
+             self.buttonZRight, self.buttonR, self.buttonStart,
+             self.dUp, self.dDown, self.dLeft, self.dRight,
+-            self.cUp, self.cDown, self.cLeft, self.cRight,
++            self.cUp, self.cDown, self.cLeft, self.cRight, self.buttonFreeCam,
+         ];
+         self.layoutCenters = [NSMutableDictionary dictionary];
+         self.layoutScales = [NSMutableDictionary dictionary];
+@@ -499,15 +601,34 @@ static HarkinianPadTouchButton* sMenuButton;
          self.editGestures = [NSMutableArray array];
          self.touchControlsOpacity = 1.0;
  
@@ -129,7 +198,33 @@ index 690a7ce..bb6579d 100644
          [self addSubview:self.controlStick];
          for (HarkinianPadTouchButton* button in self.buttons) {
              [self addSubview:button];
-@@ -520,6 +609,9 @@ static HarkinianPadTouchButton* sMenuButton;
+         }
+         [self installLayoutEditor];
++        [self applyFreeCamState];
+     }
+     return self;
+ }
+ 
++- (void)freeCamTapped {
++    // The game consumes the request on its next camera update; ignore taps it would pick up late.
++    if (!self.layoutEditing && sTouchCameraGameplayActive.load()) {
++        sFreeCamToggleRequested.store(true);
++    }
++}
++
++- (void)applyFreeCamState {
++    const BOOL active = sFreeCamActive.load();
++    [self.buttonFreeCam
++        applyIdleColor:(active ? [UIColor colorWithRed:0.22 green:0.58 blue:0.96 alpha:0.86]
++                               : [UIColor colorWithWhite:0.04 alpha:0.38])
++          pressedColor:[UIColor colorWithWhite:0.72 alpha:0.48]];
++    self.buttonFreeCam.accessibilityValue = active ? @"On" : @"Off";
++}
++
+ - (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
+     UIView* hit = [super hitTest:point withEvent:event];
+     return hit == self ? nil : hit;
+@@ -520,6 +641,9 @@ static HarkinianPadTouchButton* sMenuButton;
      CGFloat height = CGRectGetHeight(self.bounds);
      BOOL compact = height < 560.0;
  
@@ -139,7 +234,27 @@ index 690a7ce..bb6579d 100644
      if (compact) {
          // A phone needs its own grip layout. Scaling the iPad controls down
          // made the face and C buttons smaller than useful touch targets.
-@@ -1127,6 +1219,7 @@ static HarkinianPadTouchButton* sMenuButton;
+@@ -537,6 +661,9 @@ static HarkinianPadTouchButton* sMenuButton;
+         self.buttonL.frame =
+             CGRectMake(CGRectGetMinX(self.buttonR.frame), CGRectGetMaxY(self.buttonR.frame) + 8.0,
+                        shoulderWidth, shoulderHeight);
++        self.buttonFreeCam.frame =
++            CGRectMake(CGRectGetMinX(self.buttonStart.frame) - shoulderHeight - 8.0, top, shoulderHeight,
++                       shoulderHeight);
+ 
+         CGFloat dSize = 44.0;
+         CGFloat dRadius = 38.0;
+@@ -696,6 +823,9 @@ static HarkinianPadTouchButton* sMenuButton;
+     self.buttonL.frame =
+         CGRectMake(CGRectGetMinX(self.buttonR.frame), CGRectGetMaxY(self.buttonR.frame) + shoulderGap,
+                    shoulderWidth, pillHeight);
++    self.buttonFreeCam.frame =
++        CGRectMake(CGRectGetMinX(self.buttonStart.frame) - pillHeight - shoulderGap, rightRowY, pillHeight,
++                   pillHeight);
+ 
+     CGFloat labelSize = 18.0 * scale;
+     for (HarkinianPadTouchButton* button in self.buttons) {
+@@ -1127,6 +1257,7 @@ static HarkinianPadTouchButton* sMenuButton;
  }
  
  - (void)cancelAllInputs {
@@ -147,7 +262,7 @@ index 690a7ce..bb6579d 100644
      [self.controlStick cancelInput];
      for (HarkinianPadTouchButton* button in self.buttons) {
          [button cancelInput];
-@@ -1324,6 +1417,27 @@ void HarkinianPad_SetTouchControlsMenuVisible(int visible) {
+@@ -1324,6 +1455,41 @@ void HarkinianPad_SetTouchControlsMenuVisible(int visible) {
      });
  }
  
@@ -161,6 +276,20 @@ index 690a7ce..bb6579d 100644
 +
 +void HarkinianPad_SetTouchCameraGameplayActive(int active) {
 +    sTouchCameraGameplayActive.store(active != 0);
++}
++
++int HarkinianPad_ConsumeFreeCamToggle(void) {
++    return sFreeCamToggleRequested.exchange(false) ? 1 : 0;
++}
++
++void HarkinianPad_SetFreeCamActive(int active) {
++    const bool freeCamActive = active != 0;
++    if (sFreeCamActive.exchange(freeCamActive) == freeCamActive) {
++        return;
++    }
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [sTouchOverlay applyFreeCamState];
++    });
 +}
 +
 +int HarkinianPad_ConsumeTouchCameraDelta(float* dx, float* dy) {
@@ -196,22 +325,23 @@ index 576a8c3..a4bb9fd 100644
  #endif
  }
 diff --git a/soh/soh/Enhancements/controls/Mouse.cpp b/soh/soh/Enhancements/controls/Mouse.cpp
-index 043b7f8..282a13c 100644
+index 043b7f8..5e855f3 100644
 --- a/soh/soh/Enhancements/controls/Mouse.cpp
 +++ b/soh/soh/Enhancements/controls/Mouse.cpp
-@@ -7,9 +7,29 @@
+@@ -7,9 +7,30 @@
  #include "soh/Enhancements/game-interactor/GameInteractor_Hooks.h"
  #include "soh/ShipInit.hpp"
  
 +#ifdef __IOS__
 +#include "ios/HarkinianPadTouchControls.h"
++#include "soh/Enhancements/controls/TouchFreeCam.h"
 +#endif
 +
  static Ship::Coords mouseCoord = {};
  static Ship::Coords mouseCoordRel = {};
  
 +#ifdef __IOS__
-+// Drag distance for this frame in UIKit points; zero while touch camera is off.
++// Drag distance for this frame in UIKit points; zero while neither touch camera nor free camera is on.
 +static f32 touchCameraRelX = 0.0f;
 +static f32 touchCameraRelY = 0.0f;
 +
@@ -229,47 +359,244 @@ index 043b7f8..282a13c 100644
  #define CVAR_ENABLE_MOUSE_NAME CVAR_SETTING("EnableMouse")
  #define CVAR_ENABLE_MOUSE_DEFAULT 0
  #define CVAR_ENABLE_MOUSE_VALUE CVarGetInteger(CVAR_ENABLE_MOUSE_NAME, CVAR_ENABLE_MOUSE_DEFAULT)
-@@ -31,6 +51,13 @@ void Mouse_UpdatePosRel() {
+@@ -31,13 +52,37 @@ void Mouse_UpdatePosRel() {
  void Mouse_UpdateAll() {
      Mouse_UpdatePos();
      Mouse_UpdatePosRel();
 +#ifdef __IOS__
 +    if (!HarkinianPad_ConsumeTouchCameraDelta(&touchCameraRelX, &touchCameraRelY) ||
-+        !CVarGetInteger(CVAR_SETTING("HarkinianPad.TouchCamera"), 1)) {
++        (!CVarGetInteger(CVAR_SETTING("HarkinianPad.TouchCamera"), 1) && !TouchFreeCam_IsActive())) {
 +        touchCameraRelX = 0.0f;
 +        touchCameraRelY = 0.0f;
 +    }
 +#endif
++}
++
++#ifdef __IOS__
++void Mouse_GetTouchCameraDelta(f32* dx, f32* dy) {
++    *dx = touchCameraRelX;
++    *dy = touchCameraRelY;
  }
++#endif
  
  void Mouse_HandleThirdPerson(f32* newCamX, f32* newCamY) {
-@@ -38,6 +65,13 @@ void Mouse_HandleThirdPerson(f32* newCamX, f32* newCamY) {
+     if (MOUSE_ENABLED && !CVarGetInteger(CVAR_SETTING("DisableThirdPersonMouse"), 0)) {
          *newCamX -= mouseCoordRel.x * 40.0f;
          *newCamY -= mouseCoordRel.y * 40.0f;
      }
 +#ifdef __IOS__
-+    // A point is a few pixels wide, so touch needs a larger scale than the mouse.
-+    // Camera_Free multiplies newCamY by Free Look's Y inversion; cancel that out here.
-+    const f32 freeLookYSign = CVarGetInteger(CVAR_SETTING("FreeLook.InvertYAxis"), 1) ? 1.0f : -1.0f;
-+    *newCamX -= touchCameraRelX * 64.0f * TouchCamera_Sensitivity();
-+    *newCamY += touchCameraRelY * 64.0f * TouchCamera_Sensitivity() * freeLookYSign * TouchCamera_YSign();
++    // The free camera owns drags while it runs; leave the hidden orbit camera where it was.
++    if (!TouchFreeCam_IsActive()) {
++        // A point is a few pixels wide, so touch needs a larger scale than the mouse.
++        // Camera_Free multiplies newCamY by Free Look's Y inversion; cancel that out here.
++        const f32 freeLookYSign = CVarGetInteger(CVAR_SETTING("FreeLook.InvertYAxis"), 1) ? 1.0f : -1.0f;
++        *newCamX -= touchCameraRelX * 64.0f * TouchCamera_Sensitivity();
++        *newCamY += touchCameraRelY * 64.0f * TouchCamera_Sensitivity() * freeLookYSign * TouchCamera_YSign();
++    }
 +#endif
  }
  
  void Mouse_HandleFirstPerson(Player* player) {
-@@ -54,6 +88,12 @@ void Mouse_HandleFirstPerson(Player* player) {
+@@ -54,6 +99,17 @@ void Mouse_HandleFirstPerson(Player* player) {
          player->actor.focus.rot.y -= static_cast<int16_t>(mouseCoordRel.x * 6.0f * xAxisMulti * invertXAxisMulti);
          player->actor.focus.rot.x += static_cast<int16_t>(mouseCoordRel.y * 6.0f * yAxisMulti * invertYAxisMulti);
      }
 +#ifdef __IOS__
-+    const f32 touchScale = 20.0f * TouchCamera_Sensitivity();
-+    player->actor.focus.rot.y -= static_cast<int16_t>(touchCameraRelX * touchScale * xAxisMulti * invertXAxisMulti);
-+    // Positive pitch looks down, so a drag up (negative y) raises the view.
-+    player->actor.focus.rot.x += static_cast<int16_t>(touchCameraRelY * touchScale * yAxisMulti * TouchCamera_YSign());
++    if (!TouchFreeCam_IsActive()) {
++        // Through int32_t so a fast swipe wraps instead of overflowing the float-to-int16_t conversion.
++        const f32 touchScale = 20.0f * TouchCamera_Sensitivity();
++        player->actor.focus.rot.y -= static_cast<int16_t>(
++            static_cast<int32_t>(touchCameraRelX * touchScale * xAxisMulti * invertXAxisMulti));
++        // Positive pitch looks down, so a drag up (negative y) raises the view.
++        player->actor.focus.rot.x += static_cast<int16_t>(
++            static_cast<int32_t>(touchCameraRelY * touchScale * yAxisMulti * TouchCamera_YSign()));
++    }
 +#endif
  }
  
  void Mouse_RecenterCursor() {
+diff --git a/soh/soh/Enhancements/controls/Mouse.h b/soh/soh/Enhancements/controls/Mouse.h
+index c253601..f49d1cf 100644
+--- a/soh/soh/Enhancements/controls/Mouse.h
++++ b/soh/soh/Enhancements/controls/Mouse.h
+@@ -17,6 +17,10 @@ void Mouse_HandleFirstPerson(struct Player* player);
+ void Mouse_HandleShield(f32* sp50, f32* sp54);
+ bool Mouse_HandleQuickspin(bool* should, s8* iter2, s8* sp3C);
+ void Mouse_UpdateQuickspinCount();
++#ifdef __IOS__
++// This frame's touch-camera drag in UIKit points; zero when there was none.
++void Mouse_GetTouchCameraDelta(f32* dx, f32* dy);
++#endif
+ #ifdef __cplusplus
+ }; // extern "C"
+ #endif
+diff --git a/soh/soh/Enhancements/controls/TouchFreeCam.c b/soh/soh/Enhancements/controls/TouchFreeCam.c
+new file mode 100644
+index 0000000..288d1a4
+--- /dev/null
++++ b/soh/soh/Enhancements/controls/TouchFreeCam.c
+@@ -0,0 +1,133 @@
++#ifdef __IOS__
++
++#include "TouchFreeCam.h"
++
++#include "global.h"
++#include "soh/Enhancements/controls/Mouse.h"
++#include "ios/HarkinianPadTouchControls.h"
++
++#define FREE_CAM_PITCH_LIMIT 0x3800
++#define FREE_CAM_SPEED 10.0f
++#define FREE_CAM_FAST_SPEED 30.0f
++// Touch deltas are UIKit points, matching the orbiting touch camera's scale.
++#define FREE_CAM_TOUCH_LOOK_SCALE 64.0f
++#define FREE_CAM_STICK_LOOK_SCALE 12.0f
++
++static s32 sFreeCamActive = false;
++static PlayState* sFreeCamPlay = NULL;
++static Vec3f sFreeCamEye;
++static s16 sFreeCamYaw;
++static s16 sFreeCamPitch;
++
++static void TouchFreeCam_SetActive(s32 active) {
++    sFreeCamActive = active;
++    HarkinianPad_SetFreeCamActive(active);
++}
++
++s32 TouchFreeCam_IsActive(void) {
++    return sFreeCamActive;
++}
++
++void TouchFreeCam_Reset(void) {
++    HarkinianPad_ConsumeFreeCamToggle();
++    sFreeCamPlay = NULL;
++    if (sFreeCamActive) {
++        TouchFreeCam_SetActive(false);
++    }
++}
++
++static s32 TouchFreeCam_CanRun(PlayState* play) {
++    return gSaveContext.gameMode == GAMEMODE_NORMAL && play->csCtx.state == CS_STATE_IDLE && !Player_InCsMode(play);
++}
++
++static void TouchFreeCam_Start(PlayState* play) {
++    VecSph look;
++
++    // Begin from whatever is on screen.
++    OLib_Vec3fDiffToVecSphGeo(&look, &play->view.eye, &play->view.lookAt);
++    sFreeCamPlay = play;
++    sFreeCamEye = play->view.eye;
++    sFreeCamYaw = look.yaw;
++    sFreeCamPitch = CLAMP(look.pitch, -FREE_CAM_PITCH_LIMIT, FREE_CAM_PITCH_LIMIT);
++    TouchFreeCam_SetActive(true);
++}
++
++s32 TouchFreeCam_Update(PlayState* play, s16 cameraIndex) {
++    Input* input;
++    f32 touchX;
++    f32 touchY;
++    f32 lookScale;
++    f32 touchYSign;
++    f32 stickXSign;
++    f32 stickYSign;
++    f32 pitch;
++    f32 speed;
++    f32 forward;
++    f32 strafe;
++    f32 rise;
++    f32 sinYaw;
++    f32 cosYaw;
++    f32 sinPitch;
++    f32 cosPitch;
++    Vec3f at;
++    Vec3f up = { 0.0f, 1.0f, 0.0f };
++
++    if (cameraIndex != play->activeCamera) {
++        return false;
++    }
++
++    if (HarkinianPad_ConsumeFreeCamToggle()) {
++        if (sFreeCamActive) {
++            TouchFreeCam_SetActive(false);
++        } else if (TouchFreeCam_CanRun(play)) {
++            TouchFreeCam_Start(play);
++        }
++    }
++    if (!sFreeCamActive) {
++        return false;
++    }
++    if (play != sFreeCamPlay || !TouchFreeCam_CanRun(play)) {
++        TouchFreeCam_SetActive(false);
++        return false;
++    }
++
++    input = &play->state.input[0];
++
++    // Drag directions match the orbiting touch camera; a physical right stick follows Free Look's settings.
++    Mouse_GetTouchCameraDelta(&touchX, &touchY);
++    lookScale = FREE_CAM_TOUCH_LOOK_SCALE * CVarGetFloat(CVAR_SETTING("HarkinianPad.TouchCameraSensitivity"), 1.0f);
++    touchYSign = CVarGetInteger(CVAR_SETTING("HarkinianPad.TouchCameraInvertY"), 0) ? -1.0f : 1.0f;
++    stickXSign = CVarGetInteger(CVAR_SETTING("FreeLook.InvertXAxis"), 0) ? -1.0f : 1.0f;
++    stickYSign = CVarGetInteger(CVAR_SETTING("FreeLook.InvertYAxis"), 1) ? -1.0f : 1.0f;
++
++    // Turning right lowers the yaw; a positive pitch looks up.
++    // Through s32 so a fast swipe wraps instead of overflowing the float-to-s16 conversion.
++    sFreeCamYaw -= (s16)(s32)(touchX * lookScale + input->cur.right_stick_x * FREE_CAM_STICK_LOOK_SCALE * stickXSign);
++    pitch = sFreeCamPitch - touchY * lookScale * touchYSign +
++            input->cur.right_stick_y * FREE_CAM_STICK_LOOK_SCALE * stickYSign;
++    sFreeCamPitch = (s16)CLAMP(pitch, -FREE_CAM_PITCH_LIMIT, FREE_CAM_PITCH_LIMIT);
++
++    speed = CHECK_BTN_ALL(input->cur.button, BTN_A) ? FREE_CAM_FAST_SPEED : FREE_CAM_SPEED;
++    forward = CLAMP(input->rel.stick_y / 60.0f, -1.0f, 1.0f) * speed;
++    strafe = CLAMP(input->rel.stick_x / 60.0f, -1.0f, 1.0f) * speed;
++    rise = (CHECK_BTN_ALL(input->cur.button, BTN_R) ? speed : 0.0f) -
++           (CHECK_BTN_ALL(input->cur.button, BTN_Z) ? speed : 0.0f);
++
++    sinYaw = Math_SinS(sFreeCamYaw);
++    cosYaw = Math_CosS(sFreeCamYaw);
++    sinPitch = Math_SinS(sFreeCamPitch);
++    cosPitch = Math_CosS(sFreeCamPitch);
++
++    // Forward follows the view; strafing stays level along screen-right, (-cos yaw, 0, sin yaw).
++    sFreeCamEye.x += forward * cosPitch * sinYaw - strafe * cosYaw;
++    sFreeCamEye.y += forward * sinPitch + rise;
++    sFreeCamEye.z += forward * cosPitch * cosYaw + strafe * sinYaw;
++
++    at.x = sFreeCamEye.x + cosPitch * sinYaw * 100.0f;
++    at.y = sFreeCamEye.y + sinPitch * 100.0f;
++    at.z = sFreeCamEye.z + cosPitch * cosYaw * 100.0f;
++    func_800AA358(&play->view, &sFreeCamEye, &at, &up);
++    return true;
++}
++
++#endif
+diff --git a/soh/soh/Enhancements/controls/TouchFreeCam.h b/soh/soh/Enhancements/controls/TouchFreeCam.h
+new file mode 100644
+index 0000000..ddc66ef
+--- /dev/null
++++ b/soh/soh/Enhancements/controls/TouchFreeCam.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++// Free-flying camera for HarkinianPad. While it runs, the stick flies the camera, a drag on the
++// right side of the screen looks around, R rises, Z sinks and holding A flies faster; Link
++// receives no input. The camera button on the touch overlay turns it on and off.
++
++#include <libultraship/libultra.h>
++
++struct PlayState;
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Returns 1 when the free camera set this frame's view for the given camera.
++s32 TouchFreeCam_Update(struct PlayState* play, s16 cameraIndex);
++s32 TouchFreeCam_IsActive(void);
++void TouchFreeCam_Reset(void);
++
++#ifdef __cplusplus
++}
++#endif
 diff --git a/soh/soh/SohGui/SohMenuSettings.cpp b/soh/soh/SohGui/SohMenuSettings.cpp
 index 9345eef..beec5a4 100644
 --- a/soh/soh/SohGui/SohMenuSettings.cpp
@@ -323,6 +650,36 @@ index 9345eef..beec5a4 100644
  #endif
      AddWidget(path, "Clear Devices", WIDGET_BUTTON)
          .Callback([](WidgetInfo& info) {
+diff --git a/soh/src/code/z_camera.c b/soh/src/code/z_camera.c
+index e288662..a5fc6ba 100644
+--- a/soh/src/code/z_camera.c
++++ b/soh/src/code/z_camera.c
+@@ -11,6 +11,10 @@
+ #include "soh/Enhancements/game-interactor/GameInteractor_Hooks.h"
+ #include "soh/Enhancements/savestate_serialize.h"
+ 
++#ifdef __IOS__
++#include "soh/Enhancements/controls/TouchFreeCam.h"
++#endif
++
+ s16 Camera_ChangeSettingFlags(Camera* camera, s16 setting, s16 flags);
+ s32 Camera_ChangeModeFlags(Camera* camera, s16 mode, u8 flags);
+ s32 Camera_QRegInit(void);
+@@ -7659,6 +7663,14 @@ Vec3s Camera_Update(Camera* camera) {
+                      sCameraSettings[camera->setting].cameraModes[camera->mode].funcIdx);
+     }
+ 
++#ifdef __IOS__
++    // Like the debug camera below, the free camera replaces the view while the regular camera
++    // keeps tracking Link, so turning it off returns to an up-to-date view.
++    if (TouchFreeCam_Update(camera->play, camera->thisIdx)) {
++        return camera->inputDir;
++    }
++#endif
++
+     // enable/disable debug cam
+     if (CVarGetInteger(CVAR_DEVELOPER_TOOLS("DebugEnabled"), 0) &&
+         CHECK_BTN_ALL(D_8015BD7C->state.input[2].press.button, BTN_START)) {
 diff --git a/soh/src/code/z_parameter.c b/soh/src/code/z_parameter.c
 index bd7e6e4..22950a4 100644
 --- a/soh/src/code/z_parameter.c
@@ -338,14 +695,52 @@ index bd7e6e4..22950a4 100644
      // #region SOH [NTSC]
      s32 languageOffset = gSaveContext.language;
 diff --git a/soh/src/code/z_play.c b/soh/src/code/z_play.c
-index f69e8bc..5424485 100644
+index f69e8bc..6b5b933 100644
 --- a/soh/src/code/z_play.c
 +++ b/soh/src/code/z_play.c
-@@ -204,6 +204,7 @@ void Play_Destroy(GameState* thisx) {
+@@ -16,6 +16,7 @@
+ 
+ #ifdef __IOS__
+ #include "ios/HarkinianPadTouchControls.h"
++#include "soh/Enhancements/controls/TouchFreeCam.h"
+ #endif
+ 
+ #include <time.h>
+@@ -204,6 +205,8 @@ void Play_Destroy(GameState* thisx) {
  
  #ifdef __IOS__
      HarkinianPad_SetNativeHudTouchGameplayActive(0);
 +    HarkinianPad_SetTouchCameraGameplayActive(0);
++    TouchFreeCam_Reset();
  #endif
  
      GameInteractor_ExecuteOnPlayDestroy();
+diff --git a/soh/src/overlays/actors/ovl_player_actor/z_player.c b/soh/src/overlays/actors/ovl_player_actor/z_player.c
+index 542ce87..8fffe98 100644
+--- a/soh/src/overlays/actors/ovl_player_actor/z_player.c
++++ b/soh/src/overlays/actors/ovl_player_actor/z_player.c
+@@ -33,6 +33,13 @@
+ #include "soh/ResourceManagerHelpers.h"
+ #include "soh/Enhancements/savestate_serialize.h"
+ 
++#ifdef __IOS__
++#include "soh/Enhancements/controls/TouchFreeCam.h"
++#define PLAYER_FREE_CAM_ACTIVE() TouchFreeCam_IsActive()
++#else
++#define PLAYER_FREE_CAM_ACTIVE() false
++#endif
++
+ #include <string.h>
+ #include <stdlib.h>
+ #include <assert.h>
+@@ -12222,7 +12229,9 @@ void Player_Update(Actor* thisx, PlayState* play) {
+             Player_DetachHeldActor(play, this);
+         }
+ 
+-        if (this->stateFlags1 & (PLAYER_STATE1_INPUT_DISABLED | PLAYER_STATE1_IN_CUTSCENE)) {
++        // Link holds still while the free camera flies with the controls.
++        if ((this->stateFlags1 & (PLAYER_STATE1_INPUT_DISABLED | PLAYER_STATE1_IN_CUTSCENE)) ||
++            PLAYER_FREE_CAM_ACTIVE()) {
+             memset(&sp44, 0, sizeof(sp44));
+         } else {
+             sp44 = play->state.input[0];
