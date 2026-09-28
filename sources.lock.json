@@ -19,7 +19,11 @@
       "url": "https://github.com/chrissotraidis/libultraship.git",
       "commit": "7b0823020c9772c4d87291e221dd54b302b78bf6",
       "path": "sources/Shipwright/libultraship",
-      "patches": [],
+      "patches": [
+        {
+          "path": "fork-patches/libultraship-hd-texture-rows.patch"
+        }
+      ],
       "upstream_url": "https://github.com/Kenix3/libultraship.git",
       "upstream_commit": "2bfbde3a72c119f8073ad762ec6be131dff5df66"
     },

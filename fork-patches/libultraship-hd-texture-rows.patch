@@ -1,0 +1,94 @@
+diff --git a/src/fast/backends/gfx_metal.cpp b/src/fast/backends/gfx_metal.cpp
+index 00eaedbc..76f51f28 100644
+--- a/src/fast/backends/gfx_metal.cpp
++++ b/src/fast/backends/gfx_metal.cpp
+@@ -345,6 +345,13 @@ void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t wid
+         return;
+     }
+ 
++    // Metal aborts the app on a texture larger than the device supports, where other backends only
++    // fail the upload. Keep the source row pitch and upload the part that fits instead.
++    NS::UInteger bytes_per_row = 4 * (NS::UInteger)width;
++    const uint32_t max_size = (uint32_t)GetMaxTextureSize();
++    width = std::min(width, max_size);
++    height = std::min(height, max_size);
++
+     TextureDataMetal* texture_data = &mTextures[mCurrentTextureIds[mCurrentTile]];
+ 
+     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
+@@ -367,8 +374,6 @@ void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t wid
+         texture = mDevice->newTexture(texture_descriptor);
+     }
+ 
+-    NS::UInteger bytes_per_pixel = 4;
+-    NS::UInteger bytes_per_row = bytes_per_pixel * width;
+     texture->replaceRegion(region, 0, rgba32_buf, bytes_per_row);
+     texture_data->texture = texture;
+ 
+diff --git a/src/fast/interpreter.cpp b/src/fast/interpreter.cpp
+index bb3a54b8..b458c561 100644
+--- a/src/fast/interpreter.cpp
++++ b/src/fast/interpreter.cpp
+@@ -1168,35 +1168,36 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
+         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
+     uint32_t line_size_bytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
+ 
+-    // Get the resource's true image size
+-    uint32_t resourceImageSizeBytes = resource->ImageDataSize;
+-    uint32_t safeFullImageLineSizeBytes = fullImageLineSizeBytes;
+-    uint32_t safeLineSizeBytes = line_size_bytes;
+-    uint32_t safeLoadedBytes = numLoadedBytes;
+-
+-    // Sometimes the texture load commands will specify a size larger than the authentic texture
+-    // Normally the OOB info is read as garbage, but will cause a crash on some platforms
+-    // Restrict the bytes to a safe amount
+-    if (numLoadedBytes > resourceImageSizeBytes) {
+-        safeLoadedBytes = resourceImageSizeBytes;
+-        safeLineSizeBytes = resourceImageSizeBytes;
+-        safeFullImageLineSizeBytes = resourceImageSizeBytes;
+-    }
+-
+-    // Safely only copy the amount of bytes the resource can allow
+-    for (uint32_t i = 0, j = 0; i < safeLoadedBytes; i += safeLineSizeBytes, j += safeFullImageLineSizeBytes) {
+-        memcpy(mTexUploadBuffer + i, addr + j, safeLineSizeBytes);
+-    }
+-
+-    // Set the remaining bytes to load as 0
+-    if (numLoadedBytes > resourceImageSizeBytes) {
+-        memset(mTexUploadBuffer + resourceImageSizeBytes, 0, numLoadedBytes - resourceImageSizeBytes);
++    // A load block without a known image width reports the whole block as one line. Raw images
++    // are stored in rows of the resource's width, so split the block into those rows: a single row
++    // holding the whole image is wider than Metal allows, and creating it aborts the app.
++    const uint32_t imageLineSizeBytes = width * 4;
++    if (imageLineSizeBytes > 0 && line_size_bytes > imageLineSizeBytes && line_size_bytes == fullImageLineSizeBytes) {
++        line_size_bytes = fullImageLineSizeBytes = imageLineSizeBytes;
++    }
++
++    // Get the resource's true image size, less any offset of the loaded region into it
++    uint64_t availableBytes = resource->ImageDataSize;
++    if (addr >= resource->ImageData && addr < resource->ImageData + availableBytes) {
++        availableBytes -= addr - resource->ImageData;
++    }
++
++    // Sometimes the texture load commands will specify a size larger than the authentic texture.
++    // Normally the OOB info is read as garbage, but will cause a crash on some platforms, so copy
++    // only the rows the resource has and set the rest to 0.
++    uint32_t rows = line_size_bytes > 0 ? numLoadedBytes / line_size_bytes : 0;
++    for (uint32_t row = 0; row < rows; row++) {
++        uint8_t* dst = mTexUploadBuffer + (size_t)row * line_size_bytes;
++        uint64_t src = (uint64_t)row * fullImageLineSizeBytes;
++        uint32_t copyBytes = src < availableBytes ? (uint32_t)std::min<uint64_t>(line_size_bytes, availableBytes - src) : 0;
++        if (copyBytes > 0) {
++            memcpy(dst, addr + src, copyBytes);
++        }
++        memset(dst + copyBytes, 0, line_size_bytes - copyBytes);
+     }
+ 
+     // Describe the buffer by what was actually packed (the loaded HD stride)
+-    uint32_t uploadWidth = safeLineSizeBytes / 4;
+-    uint32_t uploadHeight = safeLineSizeBytes > 0 ? safeLoadedBytes / safeLineSizeBytes : 0;
+-    mRapi->UploadTexture(mTexUploadBuffer, uploadWidth, uploadHeight);
++    mRapi->UploadTexture(mTexUploadBuffer, line_size_bytes / 4, rows);
+ }
+ 
+ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
