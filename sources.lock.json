@@ -8,7 +8,7 @@
       "path": "sources/Shipwright",
       "patches": [
         {
-          "path": "patches/touch-camera.patch"
+          "path": "fork-patches/touch-camera.patch"
         }
       ],
       "upstream_url": "https://github.com/HarbourMasters/Shipwright.git",

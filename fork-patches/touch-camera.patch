@@ -176,10 +176,10 @@ index 690a7ce..bb6579d 100644
      sNativeHudTouchDesired.store(enabled != 0);
      dispatch_async(dispatch_get_main_queue(), ^{
 diff --git a/soh/soh/Enhancements/bootcommands.c b/soh/soh/Enhancements/bootcommands.c
-index 576a8c3..86206c9 100644
+index 576a8c3..a4bb9fd 100644
 --- a/soh/soh/Enhancements/bootcommands.c
 +++ b/soh/soh/Enhancements/bootcommands.c
-@@ -34,5 +34,13 @@ void BootCommands_Init() {
+@@ -34,5 +34,15 @@ void BootCommands_Init() {
      CVarSetInteger(CVAR_SETTING("HarkinianPad.NativeHudTouch"), modernTouchControls);
      HarkinianPad_SetCustomizableTouchControlsEnabled(modernTouchControls);
      HarkinianPad_SetNativeHudTouchEnabled(modernTouchControls);
@@ -187,17 +187,19 @@ index 576a8c3..86206c9 100644
 +    CVarRegisterFloat(CVAR_SETTING("HarkinianPad.TouchCameraSensitivity"), 1.0f);
 +    const int touchCamera = CVarGetInteger(CVAR_SETTING("HarkinianPad.TouchCamera"), 1);
 +    if (touchCamera) {
-+        // The third-person touch camera drives the Free Look camera.
++        // The third-person touch camera drives the Free Look camera, and first-person
++        // auto-centering would pull vertical drags back.
 +        CVarSetInteger(CVAR_SETTING("FreeLook.Enabled"), 1);
++        CVarSetInteger(CVAR_SETTING("DisableFirstPersonAutoCenterView"), 1);
 +    }
 +    HarkinianPad_SetTouchCameraEnabled(touchCamera);
  #endif
  }
 diff --git a/soh/soh/Enhancements/controls/Mouse.cpp b/soh/soh/Enhancements/controls/Mouse.cpp
-index 043b7f8..b41eb4e 100644
+index 043b7f8..282a13c 100644
 --- a/soh/soh/Enhancements/controls/Mouse.cpp
 +++ b/soh/soh/Enhancements/controls/Mouse.cpp
-@@ -7,9 +7,23 @@
+@@ -7,9 +7,29 @@
  #include "soh/Enhancements/game-interactor/GameInteractor_Hooks.h"
  #include "soh/ShipInit.hpp"
  
@@ -216,12 +218,18 @@ index 043b7f8..b41eb4e 100644
 +static f32 TouchCamera_Sensitivity() {
 +    return CVarGetFloat(CVAR_SETTING("HarkinianPad.TouchCameraSensitivity"), 1.0f);
 +}
++
++// Dragging up looks up unless the touch camera's own Y inversion is on; the stick's
++// inversion settings do not apply to touch.
++static f32 TouchCamera_YSign() {
++    return CVarGetInteger(CVAR_SETTING("HarkinianPad.TouchCameraInvertY"), 0) ? -1.0f : 1.0f;
++}
 +#endif
 +
  #define CVAR_ENABLE_MOUSE_NAME CVAR_SETTING("EnableMouse")
  #define CVAR_ENABLE_MOUSE_DEFAULT 0
  #define CVAR_ENABLE_MOUSE_VALUE CVarGetInteger(CVAR_ENABLE_MOUSE_NAME, CVAR_ENABLE_MOUSE_DEFAULT)
-@@ -31,6 +45,13 @@ void Mouse_UpdatePosRel() {
+@@ -31,6 +51,13 @@ void Mouse_UpdatePosRel() {
  void Mouse_UpdateAll() {
      Mouse_UpdatePos();
      Mouse_UpdatePosRel();
@@ -235,35 +243,38 @@ index 043b7f8..b41eb4e 100644
  }
  
  void Mouse_HandleThirdPerson(f32* newCamX, f32* newCamY) {
-@@ -38,6 +59,11 @@ void Mouse_HandleThirdPerson(f32* newCamX, f32* newCamY) {
+@@ -38,6 +65,13 @@ void Mouse_HandleThirdPerson(f32* newCamX, f32* newCamY) {
          *newCamX -= mouseCoordRel.x * 40.0f;
          *newCamY -= mouseCoordRel.y * 40.0f;
      }
 +#ifdef __IOS__
 +    // A point is a few pixels wide, so touch needs a larger scale than the mouse.
++    // Camera_Free multiplies newCamY by Free Look's Y inversion; cancel that out here.
++    const f32 freeLookYSign = CVarGetInteger(CVAR_SETTING("FreeLook.InvertYAxis"), 1) ? 1.0f : -1.0f;
 +    *newCamX -= touchCameraRelX * 64.0f * TouchCamera_Sensitivity();
-+    *newCamY -= touchCameraRelY * 64.0f * TouchCamera_Sensitivity();
++    *newCamY += touchCameraRelY * 64.0f * TouchCamera_Sensitivity() * freeLookYSign * TouchCamera_YSign();
 +#endif
  }
  
  void Mouse_HandleFirstPerson(Player* player) {
-@@ -54,6 +80,11 @@ void Mouse_HandleFirstPerson(Player* player) {
+@@ -54,6 +88,12 @@ void Mouse_HandleFirstPerson(Player* player) {
          player->actor.focus.rot.y -= static_cast<int16_t>(mouseCoordRel.x * 6.0f * xAxisMulti * invertXAxisMulti);
          player->actor.focus.rot.x += static_cast<int16_t>(mouseCoordRel.y * 6.0f * yAxisMulti * invertYAxisMulti);
      }
 +#ifdef __IOS__
 +    const f32 touchScale = 20.0f * TouchCamera_Sensitivity();
 +    player->actor.focus.rot.y -= static_cast<int16_t>(touchCameraRelX * touchScale * xAxisMulti * invertXAxisMulti);
-+    player->actor.focus.rot.x += static_cast<int16_t>(touchCameraRelY * touchScale * yAxisMulti * invertYAxisMulti);
++    // Positive pitch looks down, so a drag up (negative y) raises the view.
++    player->actor.focus.rot.x += static_cast<int16_t>(touchCameraRelY * touchScale * yAxisMulti * TouchCamera_YSign());
 +#endif
  }
  
  void Mouse_RecenterCursor() {
 diff --git a/soh/soh/SohGui/SohMenuSettings.cpp b/soh/soh/SohGui/SohMenuSettings.cpp
-index 9345eef..8950eb1 100644
+index 9345eef..beec5a4 100644
 --- a/soh/soh/SohGui/SohMenuSettings.cpp
 +++ b/soh/soh/SohGui/SohMenuSettings.cpp
-@@ -522,6 +522,37 @@ void SohMenu::AddMenuSettings() {
+@@ -522,6 +522,48 @@ void SohMenu::AddMenuSettings() {
          .Options(ButtonOptions().Tooltip(
              "Closes Settings and opens the layout editor. Drag controls, resize the selected control, hide "
              "unused buttons, or restore the phone or tablet defaults."));
@@ -277,13 +288,15 @@ index 9345eef..8950eb1 100644
 +            const bool enabled = CVarGetInteger(CVAR_SETTING("HarkinianPad.TouchCamera"), 1);
 +            if (enabled) {
 +                CVarSetInteger(CVAR_SETTING("FreeLook.Enabled"), 1);
++                CVarSetInteger(CVAR_SETTING("DisableFirstPersonAutoCenterView"), 1);
 +            }
 +            HarkinianPad_SetTouchCameraEnabled(enabled);
 +        })
 +        .Options(CheckboxOptions()
 +                     .DefaultValue(true)
 +                     .Tooltip("Drag on empty space on the right side of the screen to turn the camera, or to "
-+                              "aim in first-person view. Turns on Free Look. Targeting recenters the camera."));
++                              "aim in first-person view. Turns on Free Look and turns off first-person "
++                              "auto-centering. Targeting recenters the camera."));
 +    AddWidget(path, "Touch Camera Sensitivity", WIDGET_CVAR_SLIDER_FLOAT)
 +        .CVar(CVAR_SETTING("HarkinianPad.TouchCameraSensitivity"))
 +        .RaceDisable(false)
@@ -296,8 +309,17 @@ index 9345eef..8950eb1 100644
 +                     .Min(0.25f)
 +                     .Max(4.0f)
 +                     .DefaultValue(1.0f)
-+                     .Tooltip("How far the camera turns for each drag. Free Look's axis inversion settings also "
-+                              "apply."));
++                     .Tooltip("How far the camera turns for each drag."));
++    AddWidget(path, "Invert Touch Camera Y Axis", WIDGET_CVAR_CHECKBOX)
++        .CVar(CVAR_SETTING("HarkinianPad.TouchCameraInvertY"))
++        .RaceDisable(false)
++        .PreFunc([](WidgetInfo& info) {
++            info.isHidden = !HarkinianPad_TouchControlsAvailable() ||
++                            !CVarGetInteger(CVAR_SETTING("HarkinianPad.TouchCamera"), 1);
++        })
++        .Options(CheckboxOptions()
++                     .DefaultValue(false)
++                     .Tooltip("Dragging up looks up by default. Turn this on to make dragging up look down."));
  #endif
      AddWidget(path, "Clear Devices", WIDGET_BUTTON)
          .Callback([](WidgetInfo& info) {
