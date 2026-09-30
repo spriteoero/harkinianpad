@@ -22,6 +22,9 @@
       "patches": [
         {
           "path": "fork-patches/libultraship-hd-texture-rows.patch"
+        },
+        {
+          "path": "fork-patches/libultraship-tile-size-rounding.patch"
         }
       ],
       "upstream_url": "https://github.com/Kenix3/libultraship.git",
