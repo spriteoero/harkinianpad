@@ -12,6 +12,9 @@
         },
         {
           "path": "fork-patches/shipwright-frame-rate.patch"
+        },
+        {
+          "path": "fork-patches/shipwright-korean-menu.patch"
         }
       ],
       "upstream_url": "https://github.com/HarbourMasters/Shipwright.git",
