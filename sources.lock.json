@@ -9,6 +9,9 @@
       "patches": [
         {
           "path": "fork-patches/touch-camera.patch"
+        },
+        {
+          "path": "fork-patches/shipwright-frame-rate.patch"
         }
       ],
       "upstream_url": "https://github.com/HarbourMasters/Shipwright.git",

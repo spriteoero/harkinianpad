@@ -1,0 +1,403 @@
+diff --git a/soh/CMakeLists.txt b/soh/CMakeLists.txt
+index 6eefd0fab..7fee4a67a 100644
+--- a/soh/CMakeLists.txt
++++ b/soh/CMakeLists.txt
+@@ -144,7 +144,8 @@ list(APPEND soh__ ${CMAKE_CURRENT_SOURCE_DIR}/soh/Enhancements/speechsynthesizer
+ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+     list(FILTER soh__ EXCLUDE REGEX "^soh/Network/")
+     list(FILTER soh__ EXCLUDE REGEX "^soh/SohGui/SohMenuNetwork\\.cpp$")
+-    list(APPEND soh__ ${CMAKE_CURRENT_SOURCE_DIR}/ios/HarkinianPadTouchControls.mm ${CMAKE_CURRENT_SOURCE_DIR}/ios/HarkinianPadModImport.mm)
++    list(APPEND soh__ ${CMAKE_CURRENT_SOURCE_DIR}/ios/HarkinianPadTouchControls.mm ${CMAKE_CURRENT_SOURCE_DIR}/ios/HarkinianPadModImport.mm
++                      ${CMAKE_CURRENT_SOURCE_DIR}/ios/HarkinianPadFrameRate.mm)
+     set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/ios/HarkinianPadModImport.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+ endif()
+ 
+diff --git a/soh/ios/HarkinianPadFrameRate.h b/soh/ios/HarkinianPadFrameRate.h
+new file mode 100644
+index 000000000..0cab1a339
+--- /dev/null
++++ b/soh/ios/HarkinianPadFrameRate.h
+@@ -0,0 +1,13 @@
++#pragma once
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Asks iOS to refresh the screen `fps` times a second; ProMotion screens need this before they go past 60 Hz.
++// Call from the main thread.
++void HarkinianPad_SetDisplayFrameRate(int fps);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/soh/ios/HarkinianPadFrameRate.mm b/soh/ios/HarkinianPadFrameRate.mm
+new file mode 100644
+index 000000000..d9b1b5d45
+--- /dev/null
++++ b/soh/ios/HarkinianPadFrameRate.mm
+@@ -0,0 +1,37 @@
++#import <QuartzCore/QuartzCore.h>
++#import <UIKit/UIKit.h>
++
++#include "HarkinianPadFrameRate.h"
++
++// The game presents Metal frames from its own loop, which alone doesn't tell iOS how fast it draws: a ProMotion
++// screen can stay at 60 Hz and hold every frame beyond that back. An idle display link carries the request instead.
++@interface HarkinianPadFrameRateRequest : NSObject
++- (void)displayRefreshed:(CADisplayLink*)link;
++@end
++
++@implementation HarkinianPadFrameRateRequest
++- (void)displayRefreshed:(CADisplayLink*)link {
++}
++@end
++
++static CADisplayLink* sDisplayLink;
++static int sDisplayFrameRate;
++
++void HarkinianPad_SetDisplayFrameRate(int fps) {
++    if (fps <= 0 || fps == sDisplayFrameRate) {
++        return;
++    }
++    sDisplayFrameRate = fps;
++
++    if (sDisplayLink == nil) {
++        // The display link keeps its target alive
++        sDisplayLink = [CADisplayLink displayLinkWithTarget:[[HarkinianPadFrameRateRequest alloc] init]
++                                                   selector:@selector(displayRefreshed:)];
++        [sDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
++    }
++    if (@available(iOS 15.0, *)) {
++        sDisplayLink.preferredFrameRateRange = CAFrameRateRangeMake(fps, fps, fps);
++    } else {
++        sDisplayLink.preferredFramesPerSecond = fps;
++    }
++}
+diff --git a/soh/ios/Info.plist.in b/soh/ios/Info.plist.in
+index 13632fa0e..89b58bdfa 100644
+--- a/soh/ios/Info.plist.in
++++ b/soh/ios/Info.plist.in
+@@ -2,6 +2,8 @@
+ <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+ <plist version="1.0">
+ <dict>
++    <key>CADisableMinimumFrameDurationOnPhone</key>
++    <true/>
+     <key>CFBundleDevelopmentRegion</key>
+     <string>en</string>
+     <key>CFBundleDisplayName</key>
+diff --git a/soh/soh/OTRGlobals.cpp b/soh/soh/OTRGlobals.cpp
+index a60804303..a0b05943b 100644
+--- a/soh/soh/OTRGlobals.cpp
++++ b/soh/soh/OTRGlobals.cpp
+@@ -7,6 +7,7 @@
+ #include <vector>
+ #include <chrono>
+ #include <optional>
++#include <numeric>
+ #include <imgui.h>
+ 
+ #include "ResourceManagerHelpers.h"
+@@ -65,6 +66,7 @@
+ #include <SDL_scancode.h>
+ #ifdef __IOS__
+ #include <SDL_video.h>
++#include "ios/HarkinianPadFrameRate.h"
+ #endif
+ #else
+ #include <SDL2/SDL_scancode.h>
+@@ -1084,17 +1086,186 @@ bool OTRGlobals::HasOriginal() {
+     return hasOriginal;
+ }
+ 
+-uint32_t OTRGlobals::GetInterpolationFPS() {
++uint32_t OTRGlobals::GetRequestedInterpolationFPS() {
++    auto window = Ship::Context::GetRawInstance()->GetWindow();
+     if (CVarGetInteger(CVAR_SETTING("MatchRefreshRate"), 0)) {
+-        return Ship::Context::GetRawInstance()->GetWindow()->GetCurrentRefreshRate();
+-    } else if (CVarGetInteger(CVAR_VSYNC_ENABLED, 1) ||
+-               !Ship::Context::GetRawInstance()->GetWindow()->CanDisableVerticalSync()) {
+-        return std::min<uint32_t>(Ship::Context::GetRawInstance()->GetWindow()->GetCurrentRefreshRate(),
+-                                  CVarGetInteger(CVAR_SETTING("InterpolationFPS"), 20));
++        return window->GetCurrentRefreshRate();
++    }
++#ifdef __IOS__
++    // iOS presents every frame in step with the display, so a higher rate could only slow the game down
++    const bool vsync = true;
++#else
++    const bool vsync = CVarGetInteger(CVAR_VSYNC_ENABLED, 1) || !window->CanDisableVerticalSync();
++#endif
++    if (vsync) {
++        return std::min<uint32_t>(window->GetCurrentRefreshRate(), CVarGetInteger(CVAR_SETTING("InterpolationFPS"), 20));
+     }
+     return CVarGetInteger(CVAR_SETTING("InterpolationFPS"), 20);
+ }
+ 
++// Frame rates above 20 fps are drawn as extra interpolated frames inside each game tick, and nothing drops those
++// frames when the device can't draw them in time: every tick stretches and the whole game runs in slow motion. The
++// governor times the ticks, steps the rate down until they fit their time again, and now and then retries the rates
++// above, waiting longer after each one that fails.
++class FrameRateGovernor {
++  public:
++    // The rate to draw at: the requested one, or the step below it that the device keeps up with
++    uint32_t Limit(uint32_t requested) const {
++        return mCap != 0 && mCap < requested ? mCap : requested;
++    }
++
++    // Called after each tick is drawn, with the game's own tick rate (20 per second in gameplay)
++    void EndTick(uint32_t requested, uint32_t refreshRate, uint32_t tickRate) {
++        const Clock::time_point now = Clock::now();
++        const Clock::time_point previous = mLastTickEnd;
++        mLastTickEnd = now;
++
++        if (requested != mRequested || refreshRate != mRefreshRate || tickRate != mTickRate) {
++            Reset(requested, refreshRate, tickRate);
++            return;
++        }
++        if (!CVarGetInteger(CVAR_SETTING("AdaptiveFrameRate"), 1) || tickRate == 0 || requested <= tickRate) {
++            if (mLevel != 0) {
++                SetLevel(0);
++            }
++            return;
++        }
++        if (previous == Clock::time_point{} || mSettleTicks > 0) {
++            mSettleTicks = std::max(mSettleTicks - 1, 0);
++            return;
++        }
++
++        // A rate that isn't a multiple of the tick rate draws more frames in some ticks than in others (1, 2, 1, 2 at
++        // 30 fps), so time whole repeats of that pattern against the game time they stand for
++        mCycleSeconds += std::chrono::duration<double>(now - previous).count();
++        if (++mCycleTicks < mCycleLength) {
++            return;
++        }
++        const double ratio = mCycleSeconds * tickRate / mCycleTicks;
++        mCycleSeconds = 0.0;
++        mCycleTicks = 0;
++        mRatios[mRatioNext] = ratio;
++        mRatioNext = (mRatioNext + 1) % kMaxCycles;
++        mRatioCount = std::min(mRatioCount + 1, kMaxCycles);
++
++        if (mProbing) {
++            // A rate the device can't hold costs a hitch, so give up on it quickly
++            if (ratio > kFarTooSlow || (mRatioCount >= mProbeCycles && Median(mProbeCycles) > kSlow)) {
++                mRetryDelay[mLevel] = std::min<Clock::duration>(mRetryDelay[mLevel] * 2, kMaxRetryDelay);
++                mRetryAt[mLevel] = now + mRetryDelay[mLevel];
++                SPDLOG_INFO("Frame rate {} fps can't keep game speed, retrying in {} s", mLevels[mLevel],
++                            std::chrono::duration_cast<std::chrono::seconds>(mRetryDelay[mLevel]).count());
++                SetLevel(mLevel + 1);
++            } else if (now - mProbeStart >= kProbeHold) {
++                mProbing = false;
++                mRetryDelay[mLevel] = kFirstRetryDelay;
++            }
++            return;
++        }
++
++        if (mRatioCount < mWindowCycles) {
++            return;
++        }
++        const double median = Median(mWindowCycles);
++        if (median > kSlow && mLevel + 1 < mLevels.size()) {
++            SPDLOG_INFO("Frame rate {} fps runs the game at {:.0f}% speed, lowering it", mLevels[mLevel],
++                        100.0 / median);
++            mRetryAt[mLevel] = now + mRetryDelay[mLevel];
++            SetLevel(mLevel + 1);
++        } else if (median <= kKeepingUp && mLevel > 0 && now >= mRetryAt[mLevel - 1]) {
++            SetLevel(mLevel - 1);
++            mProbing = true;
++            mProbeStart = now;
++        }
++    }
++
++  private:
++    using Clock = std::chrono::steady_clock;
++    static constexpr size_t kMaxCycles = 8;
++    static constexpr double kSlow = 1.05; // ticks 5% over their time
++    static constexpr double kFarTooSlow = 1.25;
++    static constexpr double kKeepingUp = 1.02;
++    static constexpr Clock::duration kFirstRetryDelay = std::chrono::seconds(5);
++    static constexpr Clock::duration kMaxRetryDelay = std::chrono::seconds(80);
++    static constexpr Clock::duration kProbeHold = std::chrono::seconds(3);
++
++    void Reset(uint32_t requested, uint32_t refreshRate, uint32_t tickRate) {
++        mRequested = requested;
++        mRefreshRate = refreshRate;
++        mTickRate = tickRate;
++        // Rates that divide the refresh rate keep every frame on screen equally long, so fall back through those
++        mLevels = { requested };
++        for (uint32_t divisor = 1; refreshRate / divisor >= 20; divisor++) {
++            if (refreshRate % divisor == 0 && refreshRate / divisor < requested) {
++                mLevels.push_back(refreshRate / divisor);
++            }
++        }
++        if (mLevels.back() > 20) {
++            mLevels.push_back(20);
++        }
++        mRetryDelay.assign(mLevels.size(), kFirstRetryDelay);
++        mRetryAt.assign(mLevels.size(), Clock::time_point{});
++        mLevel = 0;
++        SetLevel(0);
++    }
++
++    void SetLevel(size_t level) {
++        if (level != mLevel) {
++            SPDLOG_INFO("Frame rate now {} fps (asked for {})", mLevels[level], mRequested);
++        }
++        mLevel = level;
++        mCap = level == 0 ? 0 : mLevels[level];
++        // Rates below the tick rate draw one frame per tick
++        const uint32_t rate = std::max(mLevels[level], mTickRate);
++        mCycleLength = mTickRate == 0 ? 1 : mTickRate / std::gcd(rate, mTickRate);
++        // Judge at least 8 ticks, or 3 ticks while trying a higher rate
++        mWindowCycles = std::clamp<size_t>((8 + mCycleLength - 1) / mCycleLength, 3, kMaxCycles);
++        mProbeCycles = std::clamp<size_t>((3 + mCycleLength - 1) / mCycleLength, 2, kMaxCycles);
++        mCycleSeconds = 0.0;
++        mCycleTicks = 0;
++        mRatioCount = 0;
++        mRatioNext = 0;
++        mSettleTicks = 2;
++        mProbing = false;
++    }
++
++    double Median(size_t count) const {
++        double values[kMaxCycles];
++        for (size_t i = 0; i < count; i++) {
++            values[i] = mRatios[(mRatioNext + kMaxCycles - 1 - i) % kMaxCycles];
++        }
++        std::nth_element(values, values + count / 2, values + count);
++        return values[count / 2];
++    }
++
++    std::vector<uint32_t> mLevels = { 20 }; // highest (the requested rate) first
++    std::vector<Clock::duration> mRetryDelay = { kFirstRetryDelay };
++    std::vector<Clock::time_point> mRetryAt = { Clock::time_point{} };
++    uint32_t mRequested = 0;
++    uint32_t mRefreshRate = 0;
++    uint32_t mTickRate = 0;
++    uint32_t mCap = 0;
++    size_t mLevel = 0;
++    uint32_t mCycleLength = 1;
++    uint32_t mCycleTicks = 0;
++    double mCycleSeconds = 0.0;
++    size_t mWindowCycles = 8;
++    size_t mProbeCycles = 3;
++    double mRatios[kMaxCycles] = {};
++    size_t mRatioCount = 0;
++    size_t mRatioNext = 0;
++    int mSettleTicks = 0;
++    bool mProbing = false;
++    Clock::time_point mProbeStart;
++    Clock::time_point mLastTickEnd;
++};
++
++static FrameRateGovernor sFrameRateGovernor;
++
++uint32_t OTRGlobals::GetInterpolationFPS() {
++    return sFrameRateGovernor.Limit(GetRequestedInterpolationFPS());
++}
++
+ extern "C" void OTRMessage_Init();
+ extern "C" void AudioMgr_CreateNextAudioBuffer(s16* samples, u32 num_samples);
+ extern "C" void AudioPlayer_Play(const uint8_t* buf, uint32_t len);
+@@ -1941,6 +2112,20 @@ extern "C" void Graph_ProcessGfxCommands(Gfx* commands) {
+     last_fps = fps;
+     last_update_rate = R_UPDATE_RATE;
+ 
++    // Settle the next tick's rate now, before the game builds its display list: scrolling textures size their
++    // interpolated tile steps by it, and fewer steps than drawn frames would flicker
++    if (wnd != nullptr && !GfxDebuggerIsDebugging()) {
++        sFrameRateGovernor.EndTick(OTRGlobals::Instance->GetRequestedInterpolationFPS(), wnd->GetCurrentRefreshRate(),
++                                   original_fps);
++    }
++#ifdef __IOS__
++    // Keep the screen at its full rate: the lower rates the governor steps down to all divide it, so each frame still
++    // shows for the same time, and retrying a higher rate doesn't have to wait for the screen to speed up first
++    if (wnd != nullptr) {
++        HarkinianPad_SetDisplayFrameRate(wnd->GetCurrentRefreshRate());
++    }
++#endif
++
+     bool curAltAssets = CVarGetInteger(CVAR_SETTING("AltAssets"), 1);
+     if (prevAltAssets != curAltAssets) {
+         prevAltAssets = curAltAssets;
+diff --git a/soh/soh/OTRGlobals.h b/soh/soh/OTRGlobals.h
+index abd40dd4b..1f11c1393 100644
+--- a/soh/soh/OTRGlobals.h
++++ b/soh/soh/OTRGlobals.h
+@@ -69,7 +69,10 @@ class OTRGlobals {
+     void RunExtract(int argc, char* argv[]);
+     bool HasMasterQuest();
+     bool HasOriginal();
++    // The frame rate the game draws at: the requested one, or lower while the device can't keep up with it
+     uint32_t GetInterpolationFPS();
++    // The frame rate the player asked for, limited to what the display can show
++    uint32_t GetRequestedInterpolationFPS();
+ 
+   private:
+     bool hasMasterQuest;
+diff --git a/soh/soh/SohGui/SohMenu.cpp b/soh/soh/SohGui/SohMenu.cpp
+index ae30f0e84..19bfd0dfe 100644
+--- a/soh/soh/SohGui/SohMenu.cpp
++++ b/soh/soh/SohGui/SohMenu.cpp
+@@ -109,7 +109,12 @@ void SohMenu::InitElement() {
+     disabledMap = {
+         { DISABLE_FOR_NO_VSYNC,
+           { [](disabledInfo& info) -> bool {
++#ifdef __IOS__
++               // iOS presents every frame in step with the display
++               return true;
++#else
+                return !Ship::Context::GetRawInstance()->GetWindow()->CanDisableVerticalSync();
++#endif
+            },
+             "Disabling VSync not supported" } },
+         { DISABLE_FOR_NO_WINDOWED_FULLSCREEN,
+diff --git a/soh/soh/SohGui/SohMenuSettings.cpp b/soh/soh/SohGui/SohMenuSettings.cpp
+index beec5a48e..83f4da43e 100644
+--- a/soh/soh/SohGui/SohMenuSettings.cpp
++++ b/soh/soh/SohGui/SohMenuSettings.cpp
+@@ -7,6 +7,7 @@
+ #include "soh/ResourceManagerHelpers.h"
+ #include "UIWidgets.hpp"
+ #include <ship/controller/controldeck/ControlDeck.h>
++#include <spdlog/fmt/fmt.h>
+ 
+ #ifdef __IOS__
+ #include "ios/HarkinianPadTouchControls.h"
+@@ -329,7 +330,12 @@ void SohMenu::AddMenuSettings() {
+     AddWidget(path, "Audio API (Needs reload)", WIDGET_AUDIO_BACKEND).RaceDisable(false);
+ 
+     // Graphics Settings
++#ifdef __IOS__
++    // iPhone and iPad screens refresh at most 120 times a second
++    static int32_t maxFps = 120;
++#else
+     static int32_t maxFps = 360;
++#endif
+     const char* tooltip = "Uses Matrix Interpolation to create extra frames, resulting in smoother graphics. This is "
+                           "purely visual and does not impact game logic, execution of glitches etc.\n\nA higher target "
+                           "FPS than your monitor's refresh rate will waste resources, and might give a worse result.";
+@@ -405,6 +411,22 @@ void SohMenu::AddMenuSettings() {
+         .CVar(CVAR_SETTING("MatchRefreshRate"))
+         .RaceDisable(false)
+         .Options(CheckboxOptions().Tooltip("Matches interpolation value to the refresh rate of your display."));
++    AddWidget(path, "Adaptive Frame Rate", WIDGET_CVAR_CHECKBOX)
++        .CVar(CVAR_SETTING("AdaptiveFrameRate"))
++        .RaceDisable(false)
++        .Options(CheckboxOptions()
++                     .Tooltip("Lowers the frame rate while the device can't draw every interpolated frame in time, so "
++                              "the game never runs in slow motion. The higher rate is tried again later.")
++                     .DefaultValue(true));
++    AddWidget(path, "Adaptive Frame Rate Status", WIDGET_TEXT)
++        .HideInSearch(true)
++        .PreFunc([](WidgetInfo& info) {
++            const uint32_t requested = OTRGlobals::Instance->GetRequestedInterpolationFPS();
++            const uint32_t drawing = OTRGlobals::Instance->GetInterpolationFPS();
++            info.isHidden = drawing >= requested;
++            info.name = fmt::format("Drawing at {} FPS to keep the game at full speed", drawing);
++        })
++        .Options(TextOptions().Color(Colors::Gray));
+     AddWidget(path, "Renderer API (Needs reload)", WIDGET_VIDEO_BACKEND).RaceDisable(false);
+     AddWidget(path, "Enable Vsync", WIDGET_CVAR_CHECKBOX)
+         .CVar(CVAR_VSYNC_ENABLED)
